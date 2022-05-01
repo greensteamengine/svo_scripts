@@ -1,0 +1,330 @@
+import spacy
+from itertools import groupby
+import string
+import csv
+import torch
+import numpy as np
+import seaborn as sns
+import matplotlib.pylab as plt
+#https://dev.to/tamuhey/how-to-calculate-the-alignment-between-bert-and-spacy-tokens-effectively-and-robustly-4e22
+import tokenizations
+from utils import *
+
+
+from transformers import AutoConfig, AutoTokenizer, AutoModelForTokenClassification
+from transformers import pipeline
+from transformers import BertTokenizer, BertModel
+from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+
+import data_handler as dh
+
+
+class TransformerTester:
+
+
+    def __init__(self, mod_ver="dslim/bert-base-NER"):
+      
+        self.model_version = mod_ver
+        self.model = AutoModelForTokenClassification.from_pretrained(self.model_version, output_attentions=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_version)
+        self.handler = dh.DataHandler()
+    
+    """
+    #get the position of the max value in a 2D tensor
+    def max_val_pos(self, t):
+        
+        vals, max_row_in_cols = t.max(0)
+
+        col_idx = int(vals.argmax(0))
+        row_idx = int(max_row_in_cols[col_idx])
+        
+        
+        return row_idx, col_idx
+    
+    
+    #get  positions of k max values in a 2D tensor
+    def k_max_val_pos(self, t, k = 1):
+        
+        h, w  = t.shape
+        
+        #topk returns values and indices, [1] -> indices
+        flat_ids = torch.topk(t.flatten(),k)[1]
+        
+        matrix_ids = list(map(lambda x: (int(x//w),int(x%w)),flat_ids))
+         
+        return matrix_ids
+    """
+    
+    #https://dev.to/tamuhey/how-to-calculate-the-alignment-between-bert-and-spacy-tokens-effectively-and-robustly-4e22
+    def is_strong_connection(self, bert_tokens, spacy_tokens, row, col, svo_from_idx, svo_to_idx):
+        """
+        Check if the strongest connection is alligned with the given grammatical dependencies
+        input:
+            bert_tokens
+            spacy_tokens
+            row
+            col
+            svo_from_idx
+            svo_to_idx
+        """
+        b2s, s2b = tokenizations.get_alignments(bert_tokens, spacy_tokens)
+        #print(f"######################## row: {row} col: {col}")
+        #print(svo_from_idx)
+        #print(svo_to_idx)
+        #print(b2s)
+        #print(s2b)
+        row_sp = -1
+        row_spacy_list = b2s[row]
+        #print("1111111 ", row_spacy_list)
+        if row_spacy_list:
+            row_sp = row_spacy_list[0]
+        
+        col_sp = -1
+        col_spacy_list = b2s[col]
+        #print("2222222 ", col_spacy_list)
+        if col_spacy_list:
+            col_sp = col_spacy_list[0]
+            
+        return (row_sp in svo_from_idx and col_sp in svo_to_idx)
+    
+    
+
+
+    def start_test(self, from_file=True, target_file_path=None, limit=None, save_fig=True):
+        
+        #data returned from data handler, see structure in handler
+        if from_file:
+            sentence_data_list = self.handler.read_dataset(file_path="svo_tagged_sentences.txt", limit=limit)
+        else:
+            write_to_file = False
+            if target_file_path != None:
+                write_to_file = True
+            sentence_data_list = self.handler.create_dataset("cv-unique-no-end-punct-sentences.csv", target_file_path, write_to_file, limit)
+
+        #matrices representing the 12 layers ad 12 heads for the given dependencies
+        sv_matches = np.zeros([12, 12])
+        vo_matches = np.zeros([12, 12])
+        
+        sv_3_matches = np.zeros([12, 12])
+        sv_3_counter = 0
+        
+        vo_3_matches = np.zeros([12, 12])
+        vo_3_counter = 0
+        
+        
+        #counter for senences that satisfy having appropriate parts (subjet, verb, object)
+        sv_sentence_num = 0
+        vo_sentence_num = 0
+        
+        total_sentence_num = len(sentence_data_list)
+        
+        for sentence_idx, sentence_data in enumerate(sentence_data_list):
+            
+            sentence = self.handler.get_sentence(sentence_data)
+            
+            if (sentence_idx%100 == 0):
+                print(f"Sentence no. {sentence_idx}/{total_sentence_num}: {sentence}")
+            
+            
+            inputs = self.tokenizer.encode_plus(sentence, return_tensors='pt', add_special_tokens=True)
+            # the token indices 
+            input_ids = inputs['input_ids']
+            # the tokenizer returns this mask as the “token_type_ids” entry
+            token_type_ids = inputs['token_type_ids']
+
+            #https://huggingface.co/docs/transformers/main_classes/output#transformers.modeling_outputs.TokenClassifierOutput
+            attentions = self.model(input_ids, token_type_ids=token_type_ids)[-1]
+
+            #sentence_b_start = None
+            input_id_list = input_ids[0].tolist() # Batch index 0
+            
+            #tokens generated by the BERT model
+            bert_tokens = self.tokenizer.convert_ids_to_tokens(input_id_list)
+            #tokens gerated by spacy
+            spacy_tokens = self.handler.get_tokens(sentence_data)
+            
+            subject_related_idx = self.handler.get_svo(sentence_data, 's')[0]
+            verb_related_idx = self.handler.get_svo(sentence_data, 'v')[0]
+            object_related_idx = self.handler.get_svo(sentence_data, 'o')[0]
+            
+            #print("<><><<><><><>", subject_related_idx)
+            
+            #check if the given sentences have subject/verb/object realted parts
+            #TODO delete, probably useless
+            has_s = bool(subject_related_idx)
+            has_v = bool(verb_related_idx)
+            has_o = bool(object_related_idx)
+            
+            #check if the given sentences have the neccessary pairs of grammatical groups
+            has_sv = has_s and has_v
+            has_vo = has_v and has_o
+            
+            #sv_sentence_num+=has_sv
+            #vo_sentence_num+=has_vo
+            
+            #iterate layers and heads
+            for layer_idx, layer in enumerate(attentions):
+                #TODO layer dx, layer name
+                for head_idx, head in enumerate(layer[0]):
+
+                    #RuntimeError: Can't call numpy() on Tensor that requires grad. Use tensor.detach().numpy() instead.
+                    #weight_sum+=head.detach().numpy()
+                    
+                    #r, c = self.max_val_pos(head)
+                    r, c = max_val_pos(head)
+
+                    
+                    #max_positions = self.k_max_val_pos(head, 3)
+                    max_positions = k_max_val_pos(head, 3)
+
+                    
+                    self.tokenizer.convert_ids_to_tokens(input_id_list)
+                    
+                    if has_sv:
+                        for pos in max_positions:
+                            if (self.is_strong_connection(bert_tokens, spacy_tokens, pos[0], pos[1], verb_related_idx, subject_related_idx)):
+                                sv_3_matches[layer_idx, head_idx]+=1
+                                sv_3_counter+=1
+                                
+                    if has_vo:
+                        for pos in max_positions:
+                            if (self.is_strong_connection(bert_tokens, spacy_tokens, pos[0], pos[1], verb_related_idx, object_related_idx)):
+                                vo_3_matches[layer_idx, head_idx]+=1
+                                vo_3_counter+=1
+                    
+                    if (has_sv and self.is_strong_connection(bert_tokens, spacy_tokens, r, c, verb_related_idx, subject_related_idx)):
+                        sv_sentence_num+=1
+                        sv_matches[layer_idx, head_idx]+=1
+                        
+                    if (has_vo and self.is_strong_connection(bert_tokens, spacy_tokens, r, c, verb_related_idx, object_related_idx)):
+                        vo_sentence_num+=1
+                        vo_matches[layer_idx, head_idx]+=1
+        
+        #https://stackoverflow.com/questions/8213522/when-to-use-cla-clf-or-close-for-clearing-a-plot-in-matplotlib
+        print(f"Subject <-> Verb ({sv_sentence_num}):")
+        print(sv_matches)
+        sv_matches_ratio = sv_matches/sv_sentence_num
+        print(sv_matches_ratio)
+        ax = sns.heatmap(sv_matches_ratio, linewidth=0.5)
+        if save_fig:
+            plt.savefig('sv.png')
+        
+        plt.show()
+        plt.clf()
+        
+        print(f"Top 3 SV matches ({sv_3_counter}):")
+        print(sv_3_matches)
+        sv_3_matches_ratio = sv_3_matches/sv_3_counter
+        print(sv_3_matches_ratio)
+        ax = sns.heatmap(sv_3_matches_ratio, linewidth=0.5)
+        if save_fig:
+            plt.savefig('top3sv.png')
+        
+        plt.show()
+        plt.clf()
+        
+        print(f"Verb <-> Object ({vo_sentence_num}):")
+        print(vo_matches)
+        vo_matches_ratio = vo_matches/vo_sentence_num
+        print(vo_matches_ratio)
+        ax = sns.heatmap(vo_matches_ratio, linewidth=0.5)
+        if save_fig:
+            plt.savefig('vo.png')
+        
+        plt.show()
+        plt.clf()
+        
+        print(f"Top 3 VO matches ({vo_3_counter}):")
+        print(vo_3_matches)
+        vo_3_matches_ratio = vo_3_matches/vo_3_counter
+        print(vo_3_matches_ratio)
+        ax = sns.heatmap(vo_3_matches_ratio, linewidth=0.5)
+        if save_fig:
+            plt.savefig('top3vo.png')
+        
+        plt.show()
+        plt.clf()
+        
+    
+    def single_sentence_test(self, example_sentence="How are you"):
+        """
+        A tester function for the exmination of the releveant datastructures in a model
+        """
+        inputs = self.tokenizer.encode_plus(example_sentence, return_tensors='pt', add_special_tokens=True)
+        
+        print(f"inputs: {inputs}")
+        input_ids = inputs['input_ids']
+        print(f"   input_ids: {input_ids}")
+        token_type_ids = inputs['token_type_ids']
+        print(f"   token_type_ids : {token_type_ids }")
+
+        input_id_list = input_ids[0].tolist() # Batch index 0
+        bert_tokens = self.tokenizer.convert_ids_to_tokens(input_id_list)
+
+        print(f"bert_tokens : {bert_tokens}")
+        
+        sentence_data = self.handler.extract_svo(example_sentence)
+        spacy_tokens = self.handler.get_tokens(sentence_data)
+        print(f"spacy_tokens: {spacy_tokens}")
+        print(f"sentence_data : {sentence_data}")
+        
+        attention = self.model(input_ids, token_type_ids=token_type_ids)[-1]
+        
+        #https://huggingface.co/docs/transformers/main_classes/output#transformers.modeling_outputs.TokenClassifierOutput
+        out = self.model(input_ids, token_type_ids=token_type_ids)
+        
+        #print(out.__dict__)
+        print(f"out (type={type(out)}): {len(out)}")
+        print(f"out[0] (type={type(out[0])}): {len(out[0])} shape: {out[0].shape}")
+        print(f"out[1] (type={type(out[1])}): {len(out[1])}")
+        print(f"out[1][0] (type={type(out[1][0])}): {len(out[1][0])} shape: {out[1][0].shape}")
+        print("#######")
+        print(type(self.model(input_ids, token_type_ids=token_type_ids)))
+        
+        a2b, b2a = tokenizations.get_alignments(bert_tokens, spacy_tokens)
+        
+        print(f"tok-comparsion; {a2b} {b2a}")
+        
+        subject_related_idx = self.handler.get_svo(sentence_data, 's')[0]
+        verb_related_idx = self.handler.get_svo(sentence_data, 'v')[0]
+        
+        print(f"subject_related_idx: {subject_related_idx}")
+        print(f"verb_related_idx: {verb_related_idx}")
+        
+        for layer_idx, layer in enumerate(attention):
+
+            for head_idx, head in enumerate(layer[0]):
+
+                #pos_max = (head==torch.max(head)).nonzero()
+                print(head)
+                #r, c = self.max_val_pos(head)
+                r, c = max_val_pos(head)
+                
+                #print(f"{r} {c} -> {self.is_strong_connection(bert_tokens, spacy_tokens, r, c, subject_related_idx, verb_related_idx)}")
+                self.is_strong_connection(bert_tokens, spacy_tokens, r, c, subject_related_idx, verb_related_idx)
+        
+        #print(len(attention))
+        print("head l:3 h:3 ->")
+        print(attention[3][3])
+        #print(attention[0])
+        
+        #print(f"attention shape: {np.ndim(attention)}")
+        #print(f"LAYER")
+        #for i, att in enumerate(attention):
+            #print(f"attention[{i}] shape: {att.shape}")
+        
+        #print(f"HEAD attention[0][0] shape: {attention[0][0].shape}")
+        #print(f"attention[0][0][0] shape: {attention[0][0][0].shape}")
+
+
+        
+
+
+if __name__ == "__main__":
+    
+    tester = TransformerTester()
+    
+    es1 = "Professor Mendeleev gave an outstanding chemistry presentation"
+    #tester.start_test(from_file=True, target_file_path="svo_tagged_sentences.txt")
+    tester.start_test(from_file=True, target_file_path=None, limit=1000, save_fig=False)
+    #tester.single_sentence_test()
